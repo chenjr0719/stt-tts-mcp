@@ -2,17 +2,17 @@
 Local STT/TTS MCP Server
 
 File-based speech-to-text and text-to-speech tools for Claude Code,
-powered by Whisper.cpp (STT) and Kokoro (TTS).
+powered by Whisper (STT) and OpenAI-compatible TTS (Kokoro/Piper).
 
-Self-hosted, zero API cost, ARM Linux compatible.
+Self-hosted, zero API cost. Supports primary + fallback endpoints.
 
 Connects to existing OpenAI-compatible STT/TTS services via HTTP API.
-Works with VoiceMode's service manager or any whisper.cpp / Kokoro instance.
 """
 
 import asyncio
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -22,7 +22,9 @@ from mcp.types import Tool, TextContent
 
 # ── Configuration ──────────────────────────────────────────────
 WHISPER_URL = os.environ.get("WHISPER_URL", "http://localhost:2022")
+WHISPER_URL_FALLBACK = os.environ.get("WHISPER_URL_FALLBACK", "")
 KOKORO_URL = os.environ.get("KOKORO_URL", "http://localhost:8880")
+KOKORO_URL_FALLBACK = os.environ.get("KOKORO_URL_FALLBACK", "")
 OUTPUT_DIR = os.environ.get(
     "STT_TTS_OUTPUT_DIR",
     os.path.join(os.path.expanduser("~"), ".stt-tts-mcp", "output"),
@@ -33,6 +35,36 @@ DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "af_sky")
 DEFAULT_SPEED = float(os.environ.get("DEFAULT_SPEED", "1.0"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ── Voice auto-selection ──────────────────────────────────────
+# Maps language prefixes to default voices per TTS backend
+VOICE_MAP = {
+    "zh": "zf_xiaobei",   # Chinese female (Kokoro) / huayan (Piper)
+    "ja": "jf_alpha",     # Japanese female (Kokoro)
+    "en": "af_sky",       # English female (Kokoro) / amy (Piper)
+}
+
+# CJK Unicode ranges for language detection
+_CJK_RE = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf]')
+_JA_RE = re.compile(r'[\u3040-\u309f\u30a0-\u30ff]')
+
+
+def _detect_language(text: str) -> str:
+    """Simple language detection based on character ranges."""
+    if _JA_RE.search(text):
+        return "ja"
+    if _CJK_RE.search(text):
+        return "zh"
+    return "en"
+
+
+def _resolve_voice(voice: str | None, text: str) -> str:
+    """Resolve voice name: use explicit voice, or auto-detect from text language."""
+    if voice and voice != DEFAULT_VOICE:
+        return voice
+    lang = _detect_language(text)
+    return VOICE_MAP.get(lang, DEFAULT_VOICE)
+
 
 # ── MCP Server ─────────────────────────────────────────────────
 app = Server("stt-tts")
@@ -70,8 +102,10 @@ async def list_tools():
         Tool(
             name="speak",
             description=(
-                "Convert text to speech using local Kokoro TTS. "
-                "Returns the path to the generated audio file (MP3)."
+                "Convert text to speech using local TTS. "
+                "Returns the path to the generated audio file (MP3). "
+                "Language is auto-detected from text (zh, ja, en). "
+                "You can override the voice with the voice parameter."
             ),
             inputSchema={
                 "type": "object",
@@ -83,8 +117,10 @@ async def list_tools():
                     "voice": {
                         "type": "string",
                         "description": (
-                            f"Voice name (default: '{DEFAULT_VOICE}'). "
-                            "Common voices: af_sky, af_bella, am_adam, am_michael"
+                            "Voice name (auto-selected by language if omitted). "
+                            "EN: af_sky, af_bella, am_adam | "
+                            "ZH: zf_xiaobei, zf_xiaoni, zm_yunxi | "
+                            "JA: jf_alpha, jf_gongitsune"
                         ),
                     },
                     "speed": {
@@ -99,7 +135,7 @@ async def list_tools():
         ),
         Tool(
             name="health",
-            description="Check the status of Whisper STT and Kokoro TTS services.",
+            description="Check the status of Whisper STT and TTS services.",
             inputSchema={"type": "object", "properties": {}},
         ),
     ]
@@ -115,6 +151,22 @@ async def call_tool(name: str, arguments: dict):
         return await do_health()
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+
+# ── Fallback helper ───────────────────────────────────────────
+def _try_with_fallback(run_fn, primary_url: str, fallback_url: str, label: str):
+    """Try run_fn with primary URL, fall back to fallback URL on failure."""
+    try:
+        result = run_fn(primary_url)
+        return result, primary_url
+    except Exception as primary_err:
+        if not fallback_url:
+            raise
+        try:
+            result = run_fn(fallback_url)
+            return result, fallback_url
+        except Exception:
+            raise primary_err  # Report the primary error
 
 
 # ── Transcribe ─────────────────────────────────────────────────
@@ -166,11 +218,12 @@ def _split_audio(file_path: str) -> list[str]:
     return chunks if chunks else [file_path]
 
 
-def _transcribe_single(file_path: str, language: str = "") -> str:
-    """Transcribe a single audio file via Whisper API."""
+def _transcribe_single_with_url(file_path: str, language: str, whisper_url: str) -> str:
+    """Transcribe a single audio file via Whisper API at a specific URL."""
     cmd = [
-        "curl", "-s", "-X", "POST",
-        f"{WHISPER_URL}/v1/audio/transcriptions",
+        "curl", "-s", "--max-time", str(TRANSCRIBE_TIMEOUT),
+        "-X", "POST",
+        f"{whisper_url}/v1/audio/transcriptions",
         "-F", f"file=@{file_path}",
         "-F", "model=whisper-1",
         "-F", "response_format=json",
@@ -179,12 +232,17 @@ def _transcribe_single(file_path: str, language: str = "") -> str:
         cmd.extend(["-F", f"language={language}"])
 
     result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=TRANSCRIBE_TIMEOUT
+        cmd, capture_output=True, text=True, timeout=TRANSCRIBE_TIMEOUT + 10
     )
     if result.returncode != 0:
         raise RuntimeError(f"Whisper error: {result.stderr}")
 
-    data = json.loads(result.stdout)
+    # Check for HTTP errors in response
+    stdout = result.stdout.strip()
+    if not stdout or stdout.startswith("Internal Server Error") or stdout.startswith("<!"):
+        raise RuntimeError(f"Whisper returned error: {stdout[:200]}")
+
+    data = json.loads(stdout)
     return data.get("text", "").strip()
 
 
@@ -204,8 +262,14 @@ async def do_transcribe(args: dict):
         is_chunked = len(chunks) > 1
 
         transcripts = []
+        used_url = WHISPER_URL
         for i, chunk in enumerate(chunks):
-            text = _transcribe_single(chunk, language)
+            def run_transcribe(url):
+                return _transcribe_single_with_url(chunk, language, url)
+
+            text, used_url = _try_with_fallback(
+                run_transcribe, WHISPER_URL, WHISPER_URL_FALLBACK, "STT"
+            )
             if text:
                 transcripts.append(text)
 
@@ -220,8 +284,13 @@ async def do_transcribe(args: dict):
             return [TextContent(type="text", text="(No speech detected in audio)")]
 
         full_text = " ".join(transcripts)
-        meta = f"[{len(chunks)} chunks]" if is_chunked else ""
-        return [TextContent(type="text", text=f"{meta} {full_text}".strip())]
+        meta_parts = []
+        if is_chunked:
+            meta_parts.append(f"{len(chunks)} chunks")
+        if used_url != WHISPER_URL:
+            meta_parts.append("fallback")
+        meta = f"[{', '.join(meta_parts)}] " if meta_parts else ""
+        return [TextContent(type="text", text=f"{meta}{full_text}".strip())]
 
     except json.JSONDecodeError as e:
         return [TextContent(type="text", text=f"Unexpected Whisper response: {e}")]
@@ -237,7 +306,7 @@ async def do_transcribe(args: dict):
 # ── Speak ──────────────────────────────────────────────────────
 async def do_speak(args: dict):
     text = args["text"]
-    voice = args.get("voice", DEFAULT_VOICE)
+    voice = _resolve_voice(args.get("voice"), text)
     speed = args.get("speed", DEFAULT_SPEED)
 
     if not text.strip():
@@ -246,36 +315,42 @@ async def do_speak(args: dict):
     timestamp = int(asyncio.get_event_loop().time() * 1000)
     out_file = os.path.join(OUTPUT_DIR, f"tts-{timestamp}.mp3")
 
-    cmd = [
-        "curl", "-s", "-X", "POST",
-        f"{KOKORO_URL}/v1/audio/speech",
-        "-H", "Content-Type: application/json",
-        "-d", json.dumps({
-            "model": "kokoro",
-            "input": text,
-            "voice": voice,
-            "speed": speed,
-        }),
-        "-o", out_file,
-    ]
-
-    try:
+    def run_speak(tts_url):
+        cmd = [
+            "curl", "-s", "--max-time", str(SPEAK_TIMEOUT),
+            "-X", "POST",
+            f"{tts_url}/v1/audio/speech",
+            "-H", "Content-Type: application/json",
+            "-d", json.dumps({
+                "model": "kokoro",
+                "input": text,
+                "voice": voice,
+                "speed": speed,
+            }),
+            "-o", out_file,
+        ]
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=SPEAK_TIMEOUT
+            cmd, capture_output=True, text=True, timeout=SPEAK_TIMEOUT + 10
         )
         if result.returncode != 0:
-            return [TextContent(type="text", text=f"TTS error: {result.stderr}")]
-
-        if os.path.exists(out_file) and os.path.getsize(out_file) > 100:
-            size_kb = os.path.getsize(out_file) / 1024
-            return [TextContent(
-                type="text",
-                text=f"Audio saved: {out_file} ({size_kb:.1f} KB)",
-            )]
-        else:
+            raise RuntimeError(f"TTS error: {result.stderr}")
+        if not os.path.exists(out_file) or os.path.getsize(out_file) <= 100:
             if os.path.exists(out_file):
                 os.remove(out_file)
-            return [TextContent(type="text", text="TTS failed — empty or invalid output")]
+            raise RuntimeError("TTS failed — empty or invalid output")
+        return out_file
+
+    try:
+        _, used_url = _try_with_fallback(
+            run_speak, KOKORO_URL, KOKORO_URL_FALLBACK, "TTS"
+        )
+        size_kb = os.path.getsize(out_file) / 1024
+        lang = _detect_language(text)
+        fallback_note = " (fallback)" if used_url != KOKORO_URL else ""
+        return [TextContent(
+            type="text",
+            text=f"Audio saved: {out_file} ({size_kb:.1f} KB, voice={voice}, lang={lang}{fallback_note})",
+        )]
     except subprocess.TimeoutExpired:
         return [TextContent(
             type="text",
@@ -286,34 +361,32 @@ async def do_speak(args: dict):
 
 
 # ── Health Check ───────────────────────────────────────────────
+def _check_endpoint(url: str, healthy_keyword: str, timeout: int = 5) -> str:
+    """Check a single endpoint health. Returns status string."""
+    try:
+        r = subprocess.run(
+            ["curl", "-s", "--max-time", str(timeout), f"{url}/health"],
+            capture_output=True, text=True, timeout=timeout + 2,
+        )
+        if r.returncode == 0 and healthy_keyword in r.stdout.lower():
+            return f"✅ healthy ({url})"
+        return f"❌ not responding ({url})"
+    except Exception:
+        return f"❌ unreachable ({url})"
+
+
 async def do_health():
     results = []
 
-    # Check Whisper
-    try:
-        r = subprocess.run(
-            ["curl", "-s", f"{WHISPER_URL}/health"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0 and "ok" in r.stdout.lower():
-            results.append(f"Whisper STT: ✅ healthy ({WHISPER_URL})")
-        else:
-            results.append(f"Whisper STT: ❌ not responding ({WHISPER_URL})")
-    except Exception:
-        results.append(f"Whisper STT: ❌ unreachable ({WHISPER_URL})")
+    # Check Whisper (primary + fallback)
+    results.append(f"Whisper STT: {_check_endpoint(WHISPER_URL, 'ok')}")
+    if WHISPER_URL_FALLBACK:
+        results.append(f"Whisper STT fallback: {_check_endpoint(WHISPER_URL_FALLBACK, 'ok')}")
 
-    # Check Kokoro
-    try:
-        r = subprocess.run(
-            ["curl", "-s", f"{KOKORO_URL}/health"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode == 0 and "healthy" in r.stdout.lower():
-            results.append(f"Kokoro TTS: ✅ healthy ({KOKORO_URL})")
-        else:
-            results.append(f"Kokoro TTS: ❌ not responding ({KOKORO_URL})")
-    except Exception:
-        results.append(f"Kokoro TTS: ❌ unreachable ({KOKORO_URL})")
+    # Check TTS (primary + fallback)
+    results.append(f"TTS: {_check_endpoint(KOKORO_URL, 'healthy')}")
+    if KOKORO_URL_FALLBACK:
+        results.append(f"TTS fallback: {_check_endpoint(KOKORO_URL_FALLBACK, 'healthy')}")
 
     return [TextContent(type="text", text="\n".join(results))]
 
